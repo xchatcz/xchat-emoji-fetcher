@@ -1,29 +1,35 @@
 #!/usr/bin/env bash
 # fetch.sh — stáhne GIF smajlíky CISLO.gif do ./sm/ podle logiky XChat URL
-# Použití: ./fetch.sh OD DO
-# Nápověda: ./fetch.sh --help
-
-set -euo pipefail
+# Volání:
+#   ./fetch.sh              -> stáhne 1..9999
+#   ./fetch.sh MAX          -> stáhne 1..MAX
+#   ./fetch.sh FROM TO      -> stáhne FROM..TO
+#   ./fetch.sh --help       -> nápověda
 
 print_help() {
 	cat <<'EOF'
 Použití:
+  ./fetch.sh
+  ./fetch.sh MAX
   ./fetch.sh OD DO
+  ./fetch.sh --help
 
 Popis:
-  Stáhne všechny soubory ve tvaru CISLO.gif do adresáře ./sm/.
+  Stáhne soubory ve tvaru CISLO.gif do adresáře ./sm/.
   URL vzor: http://x.ximg.cz/images/x4/sm/%1/%2.gif
-    - %2 = celé číslo smajlíku (bez nulování), např. 90 → "90.gif"
-    - %1 = pokud poslední dvě číslice (%2 mod 100) jsou 00–09, použije se JEDINÁ číslice 0–9
-           jinak se použijí POSLEDNÍ DVA znaky 10–99
+    - %2 = celé číslo smajlíku (např. 90 → "90.gif")
+    - %1 = pokud (%2 mod 100) je 00–09 → použije se JEDNA číslice 0–9
+           jinak POSLEDNÍ DVA znaky 10–99
 
 Příklady:
-  ./fetch.sh 0 99
-  ./fetch.sh 1 1234
+  ./fetch.sh            # 1..9999
+  ./fetch.sh 5708       # 1..5708
+  ./fetch.sh 50 5708    # 50..5708
 
 Poznámky:
   - Vyžaduje 'wget'
   - Cíl: ./sm/ (vytváří se automaticky)
+  - Existující soubory se přeskočí
 EOF
 }
 
@@ -32,45 +38,60 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 	exit 0
 fi
 
-if [[ $# -ne 2 ]]; then
-	echo "Chyba: očekávám přesně 2 parametry: OD DO" >&2
-	echo "Použijte: ./fetch.sh --help" >&2
-	exit 1
-fi
-
-from="$1"
-to="$2"
-
-# Ověření celých nezáporných čísel
+# -------- argumenty --------
 re='^[0-9]+$'
-if ! [[ $from =~ $re && $to =~ $re ]]; then
-	echo "Chyba: OD a DO musí být nezáporná celá čísla." >&2
-	exit 2
-fi
+case $# in
+	0)
+		from=1; to=9999
+		;;
+	1)
+		if [[ $1 =~ $re ]]; then from=1; to=$1; else
+			echo "Chyba: MAX musí být číslo." >&2; exit 2; fi
+		;;
+	2)
+		if [[ $1 =~ $re && $2 =~ $re ]]; then from=$1; to=$2; else
+			echo "Chyba: OD a DO musí být čísla." >&2; exit 2; fi
+		;;
+	*)
+		echo "Chyba: neplatný počet parametrů. ./fetch.sh --help" >&2
+		exit 1
+		;;
+esac
 
-# Pokud je rozsah obráceně, prohodíme
-if (( from > to )); then
-	tmp="$from"; from="$to"; to="$tmp"
-fi
+# normalizace
+if (( from > to )); then tmp=$from; from=$to; to=$tmp; fi
 
-command -v wget >/dev/null 2>&1 || { echo "Chyba: 'wget' není k dispozici." >&2; exit 3; }
+# -------- příprava --------
+if ! command -v wget >/dev/null 2>&1; then
+	echo "Chyba: 'wget' není k dispozici." >&2; exit 3
+fi
 
 mkdir -p "./sm"
-
 base_url="http://x.ximg.cz/images/x4/sm"
 
-ok=0
-fail=0
-skipped=0
+ok=0; fail=0; skipped=0
+start_ts=$(date +%s)
 
-for (( n=from; n<=to; n++ )); do
+# bezpečné ukončení + souhrn i při Ctrl+C
+finish() {
+	end_ts=$(date +%s)
+	elapsed=$(( end_ts - start_ts ))
+	hh=$(( elapsed / 3600 ))
+	mm=$(( (elapsed / 60) % 60 ))
+	ss=$(( elapsed % 60 ))
+	echo "Hotovo: ok=${ok}, fail=${fail}, skip=${skipped}"
+	printf 'Doba běhu: %02d:%02d:%02d\n' "$hh" "$mm" "$ss"
+}
+trap finish EXIT
+
+# -------- hlavní smyčka --------
+n=$from
+while (( n <= to )); do
 	last_two=$(( n % 100 ))
-	# %1: 0–9 jako jedna číslice, jinak dvouciferné 10–99
 	if (( last_two < 10 )); then
-		dir="$last_two"          # '0' až '9'
+		dir="$last_two"                  # '0'..'9'
 	else
-		# dvouciferné vypisování 10–99
-		printf -v dir "%02d" "$last_two"
+		printf -v dir "%02d" "$last_two" # '10'..'99'
 	fi
 
 	out="sm/${n}.gif"
@@ -79,11 +100,12 @@ for (( n=from; n<=to; n++ )); do
 	if [[ -s "$out" ]]; then
 		echo "skip ${n} (existuje)"
 		((skipped++))
+		n=$((n+1))
 		continue
 	fi
 
-	# stáhnout s omezením pokusů; při neúspěchu smazat nekompletní soubor
-	if wget -q -t 3 --timeout=10 -O "$out" "$url"; then
+	# Stabilnější chování: bez keep-alive, pár retry, rozumný timeout
+	if wget -nv --no-http-keep-alive -t 3 --retry-connrefused --timeout=15 -O "$out" "$url"; then
 		echo "ok   ${n} → ${out}"
 		((ok++))
 	else
@@ -91,6 +113,11 @@ for (( n=from; n<=to; n++ )); do
 		rm -f "$out" || true
 		((fail++))
 	fi
+
+	# malé zpoždění proti throttlingu
+	sleep 0.03
+	n=$((n+1))
 done
 
-echo "Hotovo: ok=${ok}, fail=${fail}, skip=${skipped}"
+# souhrn vytiskne trap finish
+exit 0
